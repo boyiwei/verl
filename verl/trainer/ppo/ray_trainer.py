@@ -463,7 +463,7 @@ class RayPPOTrainer:
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
             entry = convert_to_serializable(entry)  # Convert numpy types to native Python types
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, indent=2))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
