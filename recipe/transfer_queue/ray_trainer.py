@@ -596,13 +596,15 @@ class RayPPOTrainer:
         """Dump rollout/validation samples as JSONL."""
 
         def convert_to_serializable(obj):
-            """Convert numpy types to native Python types for JSON serialization."""
+            """Convert numpy/torch types to native Python types for JSON serialization."""
             if isinstance(obj, np.integer):
                 return int(obj)
             elif isinstance(obj, np.floating):
                 return float(obj)
             elif isinstance(obj, np.ndarray):
                 return obj.tolist()
+            elif isinstance(obj, torch.Tensor):
+                return obj.detach().cpu().tolist()
             elif isinstance(obj, (list, tuple)):
                 return [convert_to_serializable(item) for item in obj]
             elif isinstance(obj, dict):
