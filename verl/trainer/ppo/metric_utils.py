@@ -135,11 +135,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    _has_valid_tokens = valid_adv.numel() > 0
+
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
+        if _has_valid_tokens:
+            return_diff_var = torch.var(valid_returns - valid_values)
+            return_var = torch.var(valid_returns)
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -156,6 +159,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     else:
         raise ValueError("All samples are aborted, this should not happen.")
 
+    _nan = float("nan")
+
     metrics = {
         # score
         "critic/score/mean": score_mean,
@@ -166,21 +171,21 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
         # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/mean": torch.mean(valid_adv).detach().item() if _has_valid_tokens else _nan,
+        "critic/advantages/max": torch.max(valid_adv).detach().item() if _has_valid_tokens else _nan,
+        "critic/advantages/min": torch.min(valid_adv).detach().item() if _has_valid_tokens else _nan,
         # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns/mean": torch.mean(valid_returns).detach().item() if _has_valid_tokens else _nan,
+        "critic/returns/max": torch.max(valid_returns).detach().item() if _has_valid_tokens else _nan,
+        "critic/returns/min": torch.min(valid_returns).detach().item() if _has_valid_tokens else _nan,
         **(
             {
                 # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
+                "critic/values/mean": torch.mean(valid_values).detach().item() if _has_valid_tokens else _nan,
+                "critic/values/max": torch.max(valid_values).detach().item() if _has_valid_tokens else _nan,
+                "critic/values/min": torch.min(valid_values).detach().item() if _has_valid_tokens else _nan,
                 # vf explained var
-                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item() if _has_valid_tokens else _nan,
             }
             if use_critic
             else {}
