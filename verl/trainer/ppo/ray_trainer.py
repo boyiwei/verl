@@ -1031,6 +1031,12 @@ class RayPPOTrainer:
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
 
+    def _compute_ref_log_prob(self, batch):
+        """Compute reference log probs. Override in subclass for OPSD."""
+        if not self.ref_in_actor:
+            return self.ref_policy_wg.compute_ref_log_prob(batch)
+        return self.actor_rollout_wg.compute_ref_log_prob(batch)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1200,10 +1206,7 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
