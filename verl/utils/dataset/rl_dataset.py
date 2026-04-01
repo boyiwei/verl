@@ -168,7 +168,8 @@ class RLHFDataset(Dataset):
             else:
                 indices = np.arange(self.max_samples)
             self.dataframe = self.dataframe.select(indices.tolist())
-            print(f"selected {self.max_samples} random samples out of {total}")
+            mode = "random" if self.shuffle else "first"
+            print(f"selected {mode} {self.max_samples} samples out of {total}")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 

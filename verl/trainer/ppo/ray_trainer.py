@@ -1031,6 +1031,15 @@ class RayPPOTrainer:
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
 
+    def _post_reward_hook(self, batch: DataProto, reward_tensor: torch.Tensor) -> torch.Tensor:
+        """Hook called after reward is computed and old_log_probs are available.
+
+        Subclasses can override this to transform the reward tensor, e.g. to
+        implement the belief reward for 2-stage training.  The default
+        implementation returns *reward_tensor* unchanged.
+        """
+        return reward_tensor
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1217,6 +1226,8 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+
+                        reward_tensor = self._post_reward_hook(batch, reward_tensor)
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
