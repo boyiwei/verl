@@ -83,6 +83,12 @@ class HFModelConfig(BaseConfig):
 
     # path to pre-trained LoRA adapter to load for continued training
     lora_adapter_path: Optional[str] = None
+
+    # dual LoRA: separate adapters for rubric proposer and task solver
+    dual_lora: bool = False
+    rubric_lora_rank: int = 0
+    rubric_lora_alpha: int = 16
+
     use_liger: bool = False
 
     use_fused_kernels: bool = False

@@ -180,6 +180,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self.config.model.get("lora_adapter_path") is not None or self._lora_rank > 0
+        self._dual_lora = self.config.model.get("dual_lora", False) and self._is_lora
+        self._active_adapter = "task_lora" if self._dual_lora else "default"
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -436,9 +438,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
                     "bias": "none",
                 }
-                actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                if self._dual_lora:
+                    actor_module = get_peft_model(
+                        actor_module, LoraConfig(**lora_config), adapter_name="task_lora"
+                    )
+                    rubric_lora_config = {
+                        "task_type": TaskType.CAUSAL_LM,
+                        "r": int(self.config.model.get("rubric_lora_rank", self.config.model.lora_rank)),
+                        "lora_alpha": int(self.config.model.get("rubric_lora_alpha", self.config.model.lora_alpha)),
+                        "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                        "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
+                        "bias": "none",
+                    }
+                    actor_module.add_adapter("rubric_lora", LoraConfig(**rubric_lora_config))
+                    actor_module.set_adapter("task_lora")
+                    # set_adapter disables requires_grad on inactive adapters,
+                    # but we need both adapters trainable for dual-optimizer GRPO.
+                    for n, p in actor_module.named_parameters():
+                        if "lora_" in n:
+                            p.requires_grad = True
+                    if self.rank == 0:
+                        print(f"[Dual LoRA] Created task_lora (r={lora_config['r']}) "
+                              f"and rubric_lora (r={rubric_lora_config['r']})")
+                else:
+                    actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+            # PEFT initializes LoRA weights in float32; cast them to match the
+            # base model dtype so FSDP can flatten parameters with uniform dtype.
+            actor_module.to(torch_dtype)
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
+        if self._dual_lora:
+            self.use_orig_params = True
         if self.config.actor.get("freeze_vision_tower", False):
             vision_tower = get_vl_model_vision_tower(actor_module)
             if vision_tower is not None:
@@ -540,34 +571,60 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+            def _build_lr_scheduler(optimizer, optim_config):
+                total_steps = optim_config.get("total_training_steps", 0)
+                num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
+                lr_scheduler_type = optim_config.get("lr_scheduler_type", "constant")
+                min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)
+                num_cycles = optim_config.get("num_cycles", 0.5)
+                if num_warmup_steps < 0:
+                    num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
+                    num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+                if lr_scheduler_type == "constant":
+                    return get_constant_schedule_with_warmup(
+                        optimizer=optimizer, num_warmup_steps=num_warmup_steps
+                    )
+                elif lr_scheduler_type == "cosine":
+                    return get_cosine_schedule_with_warmup(
+                        optimizer=optimizer,
+                        num_warmup_steps=num_warmup_steps,
+                        num_training_steps=total_steps,
+                        min_lr_ratio=min_lr_ratio,
+                        num_cycles=num_cycles,
+                    )
+                else:
+                    raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
+
+            if self._dual_lora:
+                peft_model = getattr(actor_module_fsdp, "_fsdp_wrapped_module", actor_module_fsdp)
+                task_params = [
+                    p for n, p in peft_model.named_parameters()
+                    if "task_lora" in n and p.requires_grad
+                ]
+                rubric_params = [
+                    p for n, p in peft_model.named_parameters()
+                    if "rubric_lora" in n and p.requires_grad
+                ]
+                actor_optimizer = build_optimizer(task_params, optim_config)
+                self._rubric_optimizer = build_optimizer(rubric_params, optim_config)
+                actor_lr_scheduler = _build_lr_scheduler(actor_optimizer, optim_config)
+                self._rubric_lr_scheduler = _build_lr_scheduler(self._rubric_optimizer, optim_config)
+                if self.rank == 0:
+                    print(f"[Dual LoRA] task_lora params: {len(task_params)}, "
+                          f"rubric_lora params: {len(rubric_params)}")
+            else:
+                actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+                actor_lr_scheduler = _build_lr_scheduler(actor_optimizer, optim_config)
+                self._rubric_optimizer = None
+                self._rubric_lr_scheduler = None
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
-            lr_scheduler_type = optim_config.get("lr_scheduler_type", "constant")
-            min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)
-            num_cycles = optim_config.get("num_cycles", 0.5)
             if num_warmup_steps < 0:
                 num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
                 num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
-
             if self.rank == 0:
                 print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
-
-            if lr_scheduler_type == "constant":
-                actor_lr_scheduler = get_constant_schedule_with_warmup(
-                    optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps
-                )
-            elif lr_scheduler_type == "cosine":
-                actor_lr_scheduler = get_cosine_schedule_with_warmup(
-                    optimizer=actor_optimizer,
-                    num_warmup_steps=num_warmup_steps,
-                    num_training_steps=total_steps,
-                    min_lr_ratio=min_lr_ratio,
-                    num_cycles=num_cycles,
-                )
-            else:
-                raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
 
             log_gpu_memory_usage(f"After {role} optimizer init", logger=logger)
         else:
@@ -660,11 +717,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
-            peft_config = peft_model.peft_config.get("default", None)
+            if self._dual_lora:
+                peft_config = peft_model.peft_config.get(self._active_adapter, None)
+            else:
+                peft_config = peft_model.peft_config.get("default", None)
+            adapter_name = self._active_adapter if self._dual_lora else "default"
             params = collect_lora_params(
                 module=self.actor_module_fsdp,
                 layered_summon=self.config.rollout.get("layered_summon", False),
                 base_sync_done=self.base_sync_done,
+                adapter_name=adapter_name,
             )
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
@@ -684,6 +746,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 module=self.actor_module_fsdp,
                 layered_summon=self.layered_summon,
                 base_sync_done=False,
+                adapter_name=adapter_name,
             )
             base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
             base_model_params = convert_weight_keys(
@@ -805,7 +868,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                rubric_optimizer=getattr(self, "_rubric_optimizer", None),
             )
 
         if self._is_rollout:
@@ -864,10 +930,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+
+        adapter_name = data.meta_info.get("adapter_name", None)
+        if self._dual_lora and adapter_name:
+            self.actor.set_active_optimizer(adapter_name)
+
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            active_optimizer = self.actor_optimizer
+            if self._dual_lora and adapter_name == "rubric_lora":
+                active_optimizer = self._rubric_optimizer
+            load_fsdp_optimizer(optimizer=active_optimizer, device_id=get_device_id())
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
@@ -885,9 +959,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
-            self.actor_lr_scheduler.step()
+            if self._dual_lora and adapter_name == "rubric_lora":
+                lr = self._rubric_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+                self._rubric_lr_scheduler.step()
+            else:
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+                self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
@@ -898,10 +977,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            active_optimizer = self.actor_optimizer
+            if self._dual_lora and adapter_name == "rubric_lora":
+                active_optimizer = self._rubric_optimizer
+            offload_fsdp_optimizer(optimizer=active_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_active_adapter(self, data: DataProto):
+        """Switch the active LoRA adapter for dual-LoRA training.
+
+        Expects data.meta_info["adapter_name"] to be "task_lora" or "rubric_lora".
+        """
+        adapter_name = data.meta_info["adapter_name"]
+        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        if hasattr(peft_model, "set_adapter"):
+            peft_model.set_adapter(adapter_name)
+        self._active_adapter = adapter_name
+        if self.rank == 0:
+            print(f"[Dual LoRA] Active adapter set to: {adapter_name}")
+        return DataProto()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
@@ -1046,27 +1143,33 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
-            lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
-            peft_config = {}
-            if dist.get_rank() == 0:
-                os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(peft_model.peft_config.get("default", {}))
-                peft_config["task_type"] = peft_config["task_type"].value
-                peft_config["peft_type"] = peft_config["peft_type"].value
-                peft_config["target_modules"] = list(peft_config["target_modules"])
-            try:
-                if fsdp_version(self.actor_module_fsdp) > 0:
-                    self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
-                    lora_params = layered_summon_lora_params(self.actor_module_fsdp)
-                    if dist.get_rank() == 0:
-                        save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
-                        with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
-                            json.dump(peft_config, f, ensure_ascii=False, indent=4)
-            except Exception as e:
-                log_with_rank(
-                    f"Save LoRA Adapter Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
-                )
+            adapter_names = list(peft_model.peft_config.keys()) if self._dual_lora else ["default"]
+
+            for adapter_name in adapter_names:
+                lora_save_path = os.path.join(local_path, f"lora_adapter_{adapter_name}" if self._dual_lora else "lora_adapter")
+                adapter_cfg_obj = peft_model.peft_config.get(adapter_name, None)
+                if adapter_cfg_obj is None:
+                    continue
+                peft_cfg_dict = {}
+                if dist.get_rank() == 0:
+                    os.makedirs(lora_save_path, exist_ok=True)
+                    peft_cfg_dict = asdict(adapter_cfg_obj)
+                    peft_cfg_dict["task_type"] = peft_cfg_dict["task_type"].value
+                    peft_cfg_dict["peft_type"] = peft_cfg_dict["peft_type"].value
+                    peft_cfg_dict["target_modules"] = list(peft_cfg_dict["target_modules"])
+                try:
+                    if fsdp_version(self.actor_module_fsdp) > 0:
+                        self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
+                        lora_params = layered_summon_lora_params(self.actor_module_fsdp, adapter_name=adapter_name)
+                        if dist.get_rank() == 0:
+                            save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
+                            with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                                json.dump(peft_cfg_dict, f, ensure_ascii=False, indent=4)
+                except Exception as e:
+                    log_with_rank(
+                        f"Save LoRA Adapter Error for {adapter_name} ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
+                    )
 
             dist.barrier()
             log_with_rank(

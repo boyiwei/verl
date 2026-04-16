@@ -54,11 +54,19 @@ class DataParallelPPOActor(BasePPOActor):
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
     """
 
-    def __init__(self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self,
+        config: ActorConfig,
+        actor_module: nn.Module,
+        actor_optimizer: torch.optim.Optimizer = None,
+        rubric_optimizer: torch.optim.Optimizer = None,
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self._rubric_optimizer = rubric_optimizer
+        self._active_optimizer_name = "task_lora"
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -272,6 +280,16 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
+    def set_active_optimizer(self, adapter_name: str):
+        """Switch which optimizer is used for the next update_policy call."""
+        self._active_optimizer_name = adapter_name
+
+    @property
+    def _current_optimizer(self) -> torch.optim.Optimizer:
+        if self._active_optimizer_name == "rubric_lora" and self._rubric_optimizer is not None:
+            return self._rubric_optimizer
+        return self.actor_optimizer
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
@@ -285,12 +303,13 @@ class DataParallelPPOActor(BasePPOActor):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
+        optimizer = self._current_optimizer
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-            self.actor_optimizer.zero_grad()
+            optimizer.zero_grad()
         else:
-            self.actor_optimizer.step()
+            optimizer.step()
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -401,7 +420,7 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                self.actor_optimizer.zero_grad()
+                self._current_optimizer.zero_grad()
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -503,5 +522,5 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
-        self.actor_optimizer.zero_grad()
+        self._current_optimizer.zero_grad()
         return metrics
